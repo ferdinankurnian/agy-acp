@@ -187,7 +187,7 @@ fn test_session_load_restores_persisted_session() {
         available_models: vec![],
         skip_naration: false,
     };
-    adapter.persist_session("sess-1", Some("conv-abc"), 5, None);
+    adapter.persist_session("sess-1", Some("conv-abc"), 5, None, None);
 
     let output = adapter.handle_session_load(json!(7), &json!({"sessionId": "sess-1"}));
     let response: Value = serde_json::from_str(output.last().unwrap()).unwrap();
@@ -245,7 +245,7 @@ fn test_session_resume_restores_persisted_session() {
         available_models: vec![],
         skip_naration: false,
     };
-    adapter.persist_session("sess-r1", Some("conv-xyz"), 3, None);
+    adapter.persist_session("sess-r1", Some("conv-xyz"), 3, None, None);
 
     let response = adapter.handle_session_resume(json!(10), &json!({"sessionId": "sess-r1"}));
     assert!(response.error.is_none());
@@ -330,6 +330,7 @@ fn test_session_resume_accepts_in_memory_session() {
             conversation_id: None,
             last_step_idx: -1,
             model_id: None,
+            effort: None,
         },
     );
 
@@ -361,6 +362,7 @@ fn test_session_load_accepts_in_memory_session_without_replay() {
             conversation_id: None,
             last_step_idx: -1,
             model_id: None,
+            effort: None,
         },
     );
 
@@ -385,7 +387,7 @@ fn test_session_resume_does_not_replay_history() {
         available_models: vec![],
         skip_naration: false,
     };
-    adapter.persist_session("sess-nr", Some("conv-nr"), 10, None);
+    adapter.persist_session("sess-nr", Some("conv-nr"), 10, None, None);
 
     let response = adapter.handle_session_resume(json!(13), &json!({"sessionId": "sess-nr"}));
     assert!(response.error.is_none());
@@ -415,9 +417,9 @@ fn test_persist_and_restore_session() {
         skip_naration: false,
     };
 
-    adapter.persist_session("sess-1", Some("conv-abc"), 7, None);
+    adapter.persist_session("sess-1", Some("conv-abc"), 7, None, None);
     let restored = adapter.restore_session("sess-1");
-    assert_eq!(restored, Some(("conv-abc".to_string(), 7, None)));
+    assert_eq!(restored, Some(("conv-abc".to_string(), 7, None, None)));
 
     let missing = adapter.restore_session("sess-unknown");
     assert_eq!(missing, None);
@@ -845,17 +847,26 @@ fn test_session_new_returns_models() {
     assert!(models.get("currentModelId").is_some());
     assert!(models.get("availableModels").is_some());
     let config_options = result.get("configOptions").unwrap().as_array().unwrap();
-    assert_eq!(config_options.len(), 1);
+    assert_eq!(config_options.len(), 2);
     assert_eq!(config_options[0]["id"].as_str(), Some("model"));
     assert_eq!(config_options[0]["category"].as_str(), Some("model"));
     assert_eq!(config_options[0]["type"].as_str(), Some("select"));
     assert!(config_options[0].get("currentValue").is_some());
     assert!(config_options[0].get("options").is_some());
+    assert_eq!(config_options[1]["id"].as_str(), Some("effort"));
+    assert_eq!(config_options[1]["type"].as_str(), Some("select"));
+    assert!(config_options[1].get("currentValue").is_some());
+    assert!(config_options[1].get("options").is_some());
 }
 
 #[test]
 fn test_session_set_model() {
     let mut adapter = Adapter::new();
+    adapter.available_models = vec![
+        "Gemini 3.5 Flash (High)".to_string(),
+        "Gemini 3.5 Flash (Medium)".to_string(),
+        "Gemini 3.5 Flash (Low)".to_string(),
+    ];
     let new_resp = adapter.handle_session_new(json!(1));
     let session_id = new_resp.result.as_ref().unwrap()["sessionId"]
         .as_str()
@@ -867,15 +878,10 @@ fn test_session_set_model() {
         &json!({"sessionId": session_id, "modelId": "Gemini 3.5 Flash (High)"}),
     );
     assert!(set_resp.error.is_none());
-    assert_eq!(
-        adapter
-            .sessions
-            .get(&session_id)
-            .unwrap()
-            .model_id
-            .as_deref(),
-        Some("Gemini 3.5 Flash (High)")
-    );
+    let session = adapter.sessions.get(&session_id).unwrap();
+    // Full variant names are normalized to base + effort.
+    assert_eq!(session.model_id.as_deref(), Some("Gemini 3.5 Flash"));
+    assert_eq!(session.effort.as_deref(), Some("high"));
 }
 
 #[test]
@@ -960,7 +966,7 @@ fn test_session_set_model_persists() {
         skip_naration: false,
     };
 
-    adapter.persist_session("sess-m1", Some("conv-m1"), 0, None);
+    adapter.persist_session("sess-m1", Some("conv-m1"), 0, None, None);
 
     adapter.restore_session_state("sess-m1");
     adapter.handle_session_set_model(
@@ -981,7 +987,10 @@ fn test_session_set_model_persists() {
         Some((
             "conv-m1".to_string(),
             0,
-            Some("Claude Opus 4.6 (Thinking)".to_string())
+            Some("Claude Opus 4.6 (Thinking)".to_string()),
+            // Effort is always normalized on selection; single-variant models
+            // persist the Default ("") effort.
+            Some(String::new())
         ))
     );
 
@@ -991,12 +1000,17 @@ fn test_session_set_model_persists() {
 #[test]
 fn test_session_load_returns_models() {
     let mut adapter = Adapter::new();
+    adapter.available_models = vec![
+        "Gemini 3.1 Pro (High)".to_string(),
+        "Gemini 3.1 Pro (Low)".to_string(),
+    ];
     adapter.sessions.insert(
         "test-load".to_string(),
         crate::types::Session {
             conversation_id: None,
             last_step_idx: -1,
             model_id: Some("Gemini 3.1 Pro (High)".to_string()),
+            effort: None,
         },
     );
     adapter.persist_session(
@@ -1004,6 +1018,7 @@ fn test_session_load_returns_models() {
         Some("conv-load"),
         -1,
         Some("Gemini 3.1 Pro (High)"),
+        None,
     );
     adapter.sessions.clear();
 
@@ -1017,22 +1032,35 @@ fn test_session_load_returns_models() {
     let models = response["result"]["models"].as_object().unwrap();
     assert_eq!(
         models["currentModelId"].as_str(),
-        Some("Gemini 3.1 Pro (High)")
+        Some("Gemini 3.1 Pro")
     );
     assert_eq!(
         response["result"]["configOptions"][0]["currentValue"].as_str(),
-        Some("Gemini 3.1 Pro (High)")
+        Some("Gemini 3.1 Pro")
+    );
+    assert_eq!(
+        response["result"]["configOptions"][1]["id"].as_str(),
+        Some("effort")
+    );
+    assert_eq!(
+        response["result"]["configOptions"][1]["currentValue"].as_str(),
+        Some("high")
     );
 }
 
 #[test]
 fn test_session_resume_returns_models() {
     let mut adapter = Adapter::new();
+    adapter.available_models = vec![
+        "GPT-OSS 120B (Medium)".to_string(),
+        "GPT-OSS 120B (Low)".to_string(),
+    ];
     adapter.persist_session(
         "test-resume",
         Some("conv-resume"),
         -1,
         Some("GPT-OSS 120B (Medium)"),
+        None,
     );
     adapter.sessions.clear();
 
@@ -1043,12 +1071,15 @@ fn test_session_resume_returns_models() {
         .unwrap();
     assert_eq!(
         models["currentModelId"].as_str(),
-        Some("GPT-OSS 120B (Medium)")
+        Some("GPT-OSS 120B")
     );
     assert_eq!(
         response.result.as_ref().unwrap()["configOptions"][0]["currentValue"].as_str(),
-        Some("GPT-OSS 120B (Medium)")
+        Some("GPT-OSS 120B")
     );
+    assert_eq!(
+        response.result.as_ref().unwrap()["configOptions"][1]["currentValue"].as_str(),
+        Some("medium"))
 }
 
 #[test]
@@ -1059,7 +1090,9 @@ fn test_session_models_json_default() {
     if adapter.available_models.is_empty() {
         assert_eq!(current, "");
     } else {
-        assert_eq!(current, adapter.available_models[0]);
+        // Default is the base of the first variant (effort suffix stripped).
+        let (base, _) = Adapter::split_variant(&adapter.available_models[0]);
+        assert_eq!(current, base);
     }
 }
 
@@ -1079,7 +1112,7 @@ fn test_session_models_json_with_model() {
 fn test_session_config_options_json_with_model() {
     let mut adapter = Adapter::new();
     adapter.available_models = vec!["Model A".to_string(), "Model B".to_string()];
-    let config_options = adapter.session_config_options_json(Some("Model B"));
+    let config_options = adapter.session_config_options_json(Some("Model B"), None);
     assert_eq!(config_options[0]["id"].as_str(), Some("model"));
     assert_eq!(config_options[0]["category"].as_str(), Some("model"));
     assert_eq!(config_options[0]["type"].as_str(), Some("select"));
@@ -1088,6 +1121,13 @@ fn test_session_config_options_json_with_model() {
     assert_eq!(options.len(), 2);
     assert_eq!(options[0]["value"].as_str(), Some("Model A"));
     assert_eq!(options[1]["value"].as_str(), Some("Model B"));
+    // Effort selector exists; models without effort variants get Default.
+    assert_eq!(config_options[1]["id"].as_str(), Some("effort"));
+    assert_eq!(config_options[1]["currentValue"].as_str(), Some(""));
+    let effort_options = config_options[1]["options"].as_array().unwrap();
+    assert_eq!(effort_options.len(), 1);
+    assert_eq!(effort_options[0]["value"].as_str(), Some(""));
+    assert_eq!(effort_options[0]["name"].as_str(), Some("Default"));
 }
 
 #[test]
@@ -1119,4 +1159,147 @@ fn test_parse_available_models_skips_blank_and_status_lines() {
         parse_available_models("Gemini 3.1 Pro (High)\n"),
         vec!["Gemini 3.1 Pro (High)"]
     );
+}
+
+fn effort_fixture() -> Adapter {
+    let mut adapter = Adapter::new();
+    adapter.available_models = vec![
+        "Gemini 3.8 Flash (High)".to_string(),
+        "Gemini 3.8 Flash (Medium)".to_string(),
+        "Gemini 3.8 Flash (Low)".to_string(),
+        "Claude Sonnet 4.6 (Thinking)".to_string(),
+    ];
+    adapter.sessions.clear();
+    adapter
+}
+
+#[test]
+fn test_split_variant_extracts_effort() {
+    assert_eq!(
+        Adapter::split_variant("Gemini 3.8 Flash (High)"),
+        ("Gemini 3.8 Flash".to_string(), "high".to_string())
+    );
+    assert_eq!(
+        Adapter::split_variant("Gemini 3.8 Flash (medium)"),
+        ("Gemini 3.8 Flash".to_string(), "medium".to_string())
+    );
+    // "(Thinking)" is part of the model identity, not an effort level.
+    assert_eq!(
+        Adapter::split_variant("Claude Sonnet 4.6 (Thinking)"),
+        ("Claude Sonnet 4.6 (Thinking)".to_string(), String::new())
+    );
+    assert_eq!(
+        Adapter::split_variant("Model A"),
+        ("Model A".to_string(), String::new())
+    );
+}
+
+#[test]
+fn test_base_models_dedupes_variants() {
+    let adapter = effort_fixture();
+    assert_eq!(
+        adapter.base_models(),
+        vec![
+            "Gemini 3.8 Flash".to_string(),
+            "Claude Sonnet 4.6 (Thinking)".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn test_efforts_for_in_canonical_order() {
+    let adapter = effort_fixture();
+    assert_eq!(
+        adapter.efforts_for("Gemini 3.8 Flash"),
+        vec![
+            "low".to_string(),
+            "medium".to_string(),
+            "high".to_string()
+        ]
+    );
+    assert_eq!(
+        adapter.efforts_for("Claude Sonnet 4.6 (Thinking)"),
+        vec![String::new()]
+    );
+    assert_eq!(Adapter::effort_display("high"), "High");
+    assert_eq!(Adapter::effort_display(""), "Default");
+}
+
+#[test]
+fn test_variant_for_resolves_spawn_target() {
+    let adapter = effort_fixture();
+    assert_eq!(
+        adapter.variant_for("Gemini 3.8 Flash", "low"),
+        "Gemini 3.8 Flash (Low)"
+    );
+    assert_eq!(
+        adapter.variant_for("Claude Sonnet 4.6 (Thinking)", ""),
+        "Claude Sonnet 4.6 (Thinking)"
+    );
+    // Unknown effort falls back to the first variant of the base.
+    assert_eq!(
+        adapter.variant_for("Gemini 3.8 Flash", "max"),
+        "Gemini 3.8 Flash (High)"
+    );
+}
+
+#[test]
+fn test_models_json_collapses_effort_variants() {
+    let mut adapter = effort_fixture();
+    let models = adapter.session_models_json(None);
+    let available = models["availableModels"].as_array().unwrap();
+    assert_eq!(available.len(), 2);
+    assert_eq!(available[0]["modelId"].as_str(), Some("Gemini 3.8 Flash"));
+    assert_eq!(
+        available[1]["modelId"].as_str(),
+        Some("Claude Sonnet 4.6 (Thinking)")
+    );
+}
+
+#[test]
+fn test_effort_config_option_flow() {
+    let mut adapter = effort_fixture();
+    let new_resp = adapter.handle_session_new(json!(1));
+    let session_id = new_resp.result.as_ref().unwrap()["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Pick the base model first.
+    let set_model = adapter.handle_session_set_model(
+        json!(2),
+        &json!({"sessionId": session_id, "modelId": "Gemini 3.8 Flash"}),
+    );
+    assert!(set_model.error.is_none());
+
+    // Switch effort via the dedicated config option.
+    let set_effort = adapter.handle_session_set_config_option(
+        json!(3),
+        &json!({"sessionId": session_id, "configId": "effort", "value": "low"}),
+    );
+    assert!(set_effort.error.is_none(), "error: {:?}", set_effort.error);
+    let session = adapter.sessions.get(&session_id).unwrap();
+    assert_eq!(session.model_id.as_deref(), Some("Gemini 3.8 Flash"));
+    assert_eq!(session.effort.as_deref(), Some("low"));
+
+    let options = set_effort.result.as_ref().unwrap()["configOptions"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(options.len(), 2);
+    assert_eq!(options[1]["id"].as_str(), Some("effort"));
+    assert_eq!(options[1]["currentValue"].as_str(), Some("low"));
+
+    // Switching to a model without effort variants resets effort to Default.
+    let set_other = adapter.handle_session_set_model(
+        json!(4),
+        &json!({"sessionId": session_id, "modelId": "Claude Sonnet 4.6 (Thinking)"}),
+    );
+    assert!(set_other.error.is_none());
+    let session = adapter.sessions.get(&session_id).unwrap();
+    assert_eq!(
+        session.model_id.as_deref(),
+        Some("Claude Sonnet 4.6 (Thinking)")
+    );
+    assert_eq!(session.effort.as_deref(), Some(""));
 }

@@ -26,6 +26,9 @@ pub struct Adapter {
 
 impl Adapter {
     pub const MODEL_CONFIG_ID: &'static str = "model";
+    pub const EFFORT_CONFIG_ID: &'static str = "effort";
+    /// Reasoning effort slugs, in canonical order. Must match `agy --effort`.
+    pub const EFFORTS: [&'static str; 5] = ["low", "medium", "high", "xhigh", "max"];
 
     pub fn new() -> Self {
         Self::new_with_skip_naration(false)
@@ -57,16 +60,23 @@ impl Adapter {
     }
 
     /// Build the ACP `models` JSON for a session, given its current model_id.
+    ///
+    /// Effort-suffixed variants ("Gemini 3.8 Flash (High)") are collapsed to
+    /// their base model ("Gemini 3.8 Flash"); effort is exposed separately via
+    /// [`Self::session_config_options_json`].
     pub fn session_models_json(&mut self, model_id: Option<&str>) -> Value {
         if self.available_models.is_empty() {
             self.available_models = Self::fetch_available_models();
         }
-        let current = model_id
-            .or_else(|| self.available_models.first().map(|s| s.as_str()))
-            .unwrap_or("");
+        let (base, _) = self.resolve_selection(model_id);
+        let current = if base.is_empty() {
+            self.base_models().first().cloned().unwrap_or_default()
+        } else {
+            base
+        };
         let available: Vec<Value> = self
-            .available_models
-            .iter()
+            .base_models()
+            .into_iter()
             .map(|name| {
                 json!({
                     "modelId": name,
@@ -80,17 +90,27 @@ impl Adapter {
         })
     }
 
-    /// Build the ACP session config option that Zed uses for its model selector.
-    pub fn session_config_options_json(&mut self, model_id: Option<&str>) -> Value {
+    /// Build the ACP session config options: a Model selector (base models
+    /// only) plus a separate Effort selector for the current base model.
+    pub fn session_config_options_json(
+        &mut self,
+        model_id: Option<&str>,
+        effort: Option<&str>,
+    ) -> Value {
         if self.available_models.is_empty() {
             self.available_models = Self::fetch_available_models();
         }
-        let current = model_id
-            .or_else(|| self.available_models.first().map(|s| s.as_str()))
-            .unwrap_or("");
-        let options: Vec<Value> = self
-            .available_models
-            .iter()
+        let (base, stored_effort) = self.resolve_selection(model_id);
+        let base = if base.is_empty() {
+            self.base_models().first().cloned().unwrap_or_default()
+        } else {
+            base
+        };
+        // An explicitly passed effort wins; otherwise fall back to the stored one.
+        let preferred = effort.unwrap_or(&stored_effort).to_string();
+        let model_options: Vec<Value> = self
+            .base_models()
+            .into_iter()
             .map(|name| {
                 json!({
                     "value": name,
@@ -98,13 +118,37 @@ impl Adapter {
                 })
             })
             .collect();
-        json!([{
+        let efforts = self.efforts_for(&base);
+        let current_effort = if efforts.contains(&preferred) {
+            preferred
+        } else {
+            efforts.first().cloned().unwrap_or_default()
+        };
+        let effort_options: Vec<Value> = efforts
+            .into_iter()
+            .map(|e| {
+                json!({
+                    "value": e,
+                    "name": Self::effort_display(&e),
+                })
+            })
+            .collect();
+        json!([
+        {
             "id": Self::MODEL_CONFIG_ID,
             "name": "Model",
             "category": "model",
             "type": "select",
-            "currentValue": current,
-            "options": options,
+            "currentValue": base,
+            "options": model_options,
+        },
+        {
+            "id": Self::EFFORT_CONFIG_ID,
+            "name": "Effort",
+            "category": "effort",
+            "type": "select",
+            "currentValue": current_effort,
+            "options": effort_options,
         }])
     }
 
@@ -112,12 +156,121 @@ impl Adapter {
         &mut self,
         session_id: &str,
         model_id: Option<&str>,
+        effort: Option<&str>,
     ) -> Value {
         json!({
             "sessionId": session_id,
             "models": self.session_models_json(model_id),
-            "configOptions": self.session_config_options_json(model_id),
+            "configOptions": self.session_config_options_json(model_id, effort),
         })
+    }
+
+    /// Split a variant display name into (base, effort slug).
+    ///
+    /// "Gemini 3.8 Flash (High)" -> ("Gemini 3.8 Flash", "high").
+    /// Names without a known effort suffix keep ("name", "").
+    pub fn split_variant(display: &str) -> (String, String) {
+        let trimmed = display.trim();
+        if let Some(open) = trimmed.rfind(" (") {
+            if trimmed.ends_with(')') {
+                let suffix = trimmed[open + 2..trimmed.len() - 1].to_lowercase();
+                if Self::EFFORTS.contains(&suffix.as_str()) {
+                    return (trimmed[..open].trim().to_string(), suffix);
+                }
+            }
+        }
+        (trimmed.to_string(), String::new())
+    }
+
+    /// Distinct base model display names, in first-seen order.
+    pub fn base_models(&self) -> Vec<String> {
+        let mut bases = Vec::new();
+        for variant in &self.available_models {
+            let (base, _) = Self::split_variant(variant);
+            if !bases.contains(&base) {
+                bases.push(base);
+            }
+        }
+        bases
+    }
+
+    /// Effort slugs available for a base model, in canonical order.
+    /// Returns [""] (single Default choice) when the base has no effort variants.
+    pub fn efforts_for(&self, base: &str) -> Vec<String> {
+        let mut found = Vec::new();
+        for variant in &self.available_models {
+            let (b, effort) = Self::split_variant(variant);
+            if b == base && !effort.is_empty() && !found.contains(&effort) {
+                found.push(effort);
+            }
+        }
+        if found.is_empty() {
+            return vec![String::new()];
+        }
+        let mut ordered: Vec<String> = Self::EFFORTS
+            .iter()
+            .filter(|e| found.contains(&e.to_string()))
+            .map(|e| e.to_string())
+            .collect();
+        // Keep any unexpected effort labels at the end, in first-seen order.
+        for e in found {
+            if !ordered.contains(&e) {
+                ordered.push(e);
+            }
+        }
+        ordered
+    }
+
+    /// Human label for an effort slug ("" renders as Default).
+    pub fn effort_display(effort: &str) -> String {
+        if effort.is_empty() {
+            return "Default".to_string();
+        }
+        let mut chars = effort.chars();
+        match chars.next() {
+            None => "Default".to_string(),
+            Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        }
+    }
+
+    /// Normalize a stored/selected model id into (base, effort).
+    ///
+    /// Accepts both full variant names ("Gemini 3.8 Flash (High)", including
+    /// selections persisted before the effort split) and bare base names.
+    pub fn resolve_selection(&self, model_id: Option<&str>) -> (String, String) {
+        let Some(raw) = model_id.map(str::trim).filter(|s| !s.is_empty()) else {
+            return (String::new(), String::new());
+        };
+        if self.available_models.iter().any(|v| v == raw) {
+            return Self::split_variant(raw);
+        }
+        let base = raw.to_string();
+        let effort = self
+            .efforts_for(&base)
+            .first()
+            .cloned()
+            .unwrap_or_default();
+        (base, effort)
+    }
+
+    /// Full variant display name to pass to `agy --model` for a (base, effort).
+    pub fn variant_for(&self, base: &str, effort: &str) -> String {
+        for variant in &self.available_models {
+            let (b, e) = Self::split_variant(variant);
+            if b == base && e == effort {
+                return variant.clone();
+            }
+        }
+        if self.available_models.iter().any(|v| v == base) {
+            return base.to_string();
+        }
+        for variant in &self.available_models {
+            let (b, _) = Self::split_variant(variant);
+            if b == base {
+                return variant.clone();
+            }
+        }
+        base.to_string()
     }
 
     /// Acquire exclusive lock on a dedicated lock file for read-write mutual exclusion.
@@ -150,13 +303,22 @@ impl Adapter {
         self.load_store_inner()
     }
 
-    /// Try to restore conversation_id, last_step_idx, and model_id from persisted state.
-    pub fn restore_session(&self, session_id: &str) -> Option<(String, i64, Option<String>)> {
+    /// Try to restore conversation_id, last_step_idx, model base and effort from
+    /// persisted state.
+    pub fn restore_session(
+        &self,
+        session_id: &str,
+    ) -> Option<(String, i64, Option<String>, Option<String>)> {
         let store = self.load_store();
         store.sessions.get(session_id).and_then(|s| {
-            s.conversation_id
-                .clone()
-                .map(|cid| (cid, s.last_step_idx, s.model_id.clone()))
+            s.conversation_id.clone().map(|cid| {
+                (
+                    cid,
+                    s.last_step_idx,
+                    s.model_id.clone(),
+                    s.effort.clone(),
+                )
+            })
         })
     }
 
@@ -167,6 +329,7 @@ impl Adapter {
         conversation_id: Option<&str>,
         last_step_idx: i64,
         model_id: Option<&str>,
+        effort: Option<&str>,
     ) {
         let Some(_lock) = self.lock_state_file() else {
             return;
@@ -178,6 +341,7 @@ impl Adapter {
                 conversation_id: conversation_id.map(String::from),
                 last_step_idx,
                 model_id: model_id.map(String::from),
+                effort: effort.map(String::from),
             },
         );
         let tmp = self.state_file.with_extension("tmp");
@@ -217,7 +381,8 @@ impl Adapter {
     }
 
     pub fn restore_session_state(&mut self, session_id: &str) -> bool {
-        let Some((conversation_id, last_step_idx, model_id)) = self.restore_session(session_id)
+        let Some((conversation_id, last_step_idx, model_id, effort)) =
+            self.restore_session(session_id)
         else {
             return false;
         };
@@ -230,6 +395,7 @@ impl Adapter {
                 conversation_id: Some(conversation_id),
                 last_step_idx,
                 model_id,
+                effort,
             },
         );
         true
@@ -261,9 +427,10 @@ impl Adapter {
                 conversation_id: None,
                 last_step_idx: -1,
                 model_id: None,
+                effort: None,
             },
         );
-        let result = self.session_config_result_json(&session_id, None);
+        let result = self.session_config_result_json(&session_id, None, None);
         JsonRpcResponse {
             jsonrpc: "2.0",
             id,
@@ -302,11 +469,11 @@ impl Adapter {
         }
 
         vec![{
-            let model_id = self
-                .sessions
-                .get(session_id)
-                .and_then(|s| s.model_id.clone());
-            let result = self.session_config_result_json(session_id, model_id.as_deref());
+            let session = self.sessions.get(session_id);
+            let model_id = session.and_then(|s| s.model_id.clone());
+            let effort = session.and_then(|s| s.effort.clone());
+            let result =
+                self.session_config_result_json(session_id, model_id.as_deref(), effort.as_deref());
             serde_json::to_string(&JsonRpcResponse {
                 jsonrpc: "2.0",
                 id,
@@ -333,11 +500,11 @@ impl Adapter {
         }
 
         if self.sessions.contains_key(session_id) || self.restore_session_state(session_id) {
-            let model_id = self
-                .sessions
-                .get(session_id)
-                .and_then(|s| s.model_id.clone());
-            let result = self.session_config_result_json(session_id, model_id.as_deref());
+            let session = self.sessions.get(session_id);
+            let model_id = session.and_then(|s| s.model_id.clone());
+            let effort = session.and_then(|s| s.effort.clone());
+            let result =
+                self.session_config_result_json(session_id, model_id.as_deref(), effort.as_deref());
             return JsonRpcResponse {
                 jsonrpc: "2.0",
                 id,
@@ -377,6 +544,24 @@ impl Adapter {
             let _ = self.restore_session_state(session_id);
         }
 
+        // Accept both base names and legacy full variant names; keep the
+        // current effort when it is valid for the new base. Reads happen
+        // before the mutable borrow below.
+        let (base, variant_effort) = self.resolve_selection(Some(model_id));
+        let current_effort = self
+            .sessions
+            .get(session_id)
+            .and_then(|s| s.effort.clone())
+            .unwrap_or_default();
+        let efforts = self.efforts_for(&base);
+        let effort = if efforts.contains(&current_effort) {
+            current_effort
+        } else if efforts.contains(&variant_effort) {
+            variant_effort
+        } else {
+            efforts.first().cloned().unwrap_or_default()
+        };
+
         let Some(session) = self.sessions.get_mut(session_id) else {
             return JsonRpcResponse {
                 jsonrpc: "2.0",
@@ -389,8 +574,8 @@ impl Adapter {
             };
         };
 
-        session.model_id = Some(model_id.to_string());
-        let model_id_str = session.model_id.clone();
+        session.model_id = Some(base.clone());
+        session.effort = Some(effort.clone());
         let last_step_idx = session.last_step_idx;
         let conv_id = session.conversation_id.clone();
 
@@ -398,7 +583,8 @@ impl Adapter {
             session_id,
             conv_id.as_deref(),
             last_step_idx,
-            model_id_str.as_deref(),
+            Some(&base),
+            Some(&effort),
         );
 
         JsonRpcResponse {
@@ -422,9 +608,9 @@ impl Adapter {
             .get("configId")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        let model_id = params.get("value").and_then(|v| v.as_str()).unwrap_or("");
+        let value = params.get("value").and_then(|v| v.as_str()).unwrap_or("");
 
-        if session_id.is_empty() || config_id.is_empty() || model_id.is_empty() {
+        if session_id.is_empty() || config_id.is_empty() || value.is_empty() {
             return JsonRpcResponse {
                 jsonrpc: "2.0",
                 id,
@@ -435,7 +621,7 @@ impl Adapter {
             };
         }
 
-        if config_id != Self::MODEL_CONFIG_ID {
+        if config_id != Self::MODEL_CONFIG_ID && config_id != Self::EFFORT_CONFIG_ID {
             return JsonRpcResponse {
                 jsonrpc: "2.0",
                 id,
@@ -451,6 +637,47 @@ impl Adapter {
             let _ = self.restore_session_state(session_id);
         }
 
+        // Normalize against the model list before taking a mutable borrow.
+        let (base, variant_effort) = self.resolve_selection(Some(value));
+        let current = self
+            .sessions
+            .get(session_id)
+            .map(|s| {
+                (
+                    s.model_id.clone().unwrap_or_default(),
+                    s.effort.clone().unwrap_or_default(),
+                )
+            })
+            .unwrap_or_default();
+
+        let (new_base, new_effort) = if config_id == Self::EFFORT_CONFIG_ID {
+            let efforts = self.efforts_for(&current.0);
+            let effort = if efforts.contains(&value.to_string()) {
+                value.to_string()
+            } else {
+                // Unknown effort for this base: keep current, or fall back to default.
+                if efforts.contains(&current.1) {
+                    current.1.clone()
+                } else {
+                    // `value` may itself be a full variant name; honor its effort
+                    // when valid for the current base.
+                    let (_, e) = Self::split_variant(value);
+                    if efforts.contains(&e) { e } else { efforts.first().cloned().unwrap_or_default() }
+                }
+            };
+            (current.0.clone(), effort)
+        } else {
+            let efforts = self.efforts_for(&base);
+            let effort = if efforts.contains(&current.1) {
+                current.1.clone()
+            } else if efforts.contains(&variant_effort) {
+                variant_effort
+            } else {
+                efforts.first().cloned().unwrap_or_default()
+            };
+            (base, effort)
+        };
+
         let Some(session) = self.sessions.get_mut(session_id) else {
             return JsonRpcResponse {
                 jsonrpc: "2.0",
@@ -463,8 +690,8 @@ impl Adapter {
             };
         };
 
-        session.model_id = Some(model_id.to_string());
-        let model_id_str = session.model_id.clone();
+        session.model_id = Some(new_base.clone());
+        session.effort = Some(new_effort.clone());
         let last_step_idx = session.last_step_idx;
         let conv_id = session.conversation_id.clone();
 
@@ -472,10 +699,11 @@ impl Adapter {
             session_id,
             conv_id.as_deref(),
             last_step_idx,
-            model_id_str.as_deref(),
+            Some(&new_base),
+            Some(&new_effort),
         );
 
-        let config_options = self.session_config_options_json(model_id_str.as_deref());
+        let config_options = self.session_config_options_json(Some(&new_base), Some(&new_effort));
         JsonRpcResponse {
             jsonrpc: "2.0",
             id,
@@ -525,8 +753,16 @@ impl Adapter {
                 args.push(conv_id.clone());
             }
             if let Some(model_id) = &session.model_id {
+                let stored_effort = session.effort.clone().unwrap_or_default();
+                let (base, resolved_effort) = self.resolve_selection(Some(model_id));
+                let efforts = self.efforts_for(&base);
+                let effort = if efforts.contains(&stored_effort) {
+                    stored_effort
+                } else {
+                    resolved_effort
+                };
                 args.push("--model".to_string());
-                args.push(model_id.clone());
+                args.push(self.variant_for(&base, &effort));
             }
         }
         args.push("-p".to_string());
@@ -616,15 +852,15 @@ impl Adapter {
             }
         }
         if bound_conv_id.is_some() {
-            let model_id = self
-                .sessions
-                .get(session_id)
-                .and_then(|s| s.model_id.clone());
+            let session = self.sessions.get(session_id);
+            let model_id = session.and_then(|s| s.model_id.clone());
+            let effort = session.and_then(|s| s.effort.clone());
             self.persist_session(
                 session_id,
                 bound_conv_id.as_deref(),
                 new_step_idx,
                 model_id.as_deref(),
+                effort.as_deref(),
             );
         }
 

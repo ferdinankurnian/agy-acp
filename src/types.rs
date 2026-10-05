@@ -38,15 +38,20 @@ pub struct StoredSession {
     /// Last stream-json step index observed for this conversation.
     #[serde(default)]
     pub last_step_idx: i64,
-    /// Selected model ID for this session.
+    /// Selected model base ID for this session (effort suffix stripped).
     #[serde(default)]
     pub model_id: Option<String>,
+    /// Selected reasoning effort slug (low|medium|high|xhigh|max), "" = default.
+    #[serde(default)]
+    pub effort: Option<String>,
 }
 
 pub struct Session {
     pub conversation_id: Option<String>,
     /// Last stream-json step index observed for this conversation.
     pub last_step_idx: i64,
-    /// Selected model ID for this session.
+    /// Selected model base ID for this session (effort suffix stripped).
     pub model_id: Option<String>,
+    /// Selected reasoning effort slug (low|medium|high|xhigh|max), "" = default.
+    pub effort: Option<String>,
 }
