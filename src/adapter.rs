@@ -101,12 +101,15 @@ impl Adapter {
             self.available_models = Self::fetch_available_models();
         }
         let (base, stored_effort) = self.resolve_selection(model_id);
+        // An explicitly passed effort wins; otherwise fall back to the stored one.
+        // An empty base means "no model chosen yet": default to the first base so
+        // the effort selector always reflects a real model (T3 may set only
+        // effort, relying on the session default).
         let base = if base.is_empty() {
             self.base_models().first().cloned().unwrap_or_default()
         } else {
             base
         };
-        // An explicitly passed effort wins; otherwise fall back to the stored one.
         let preferred = effort.unwrap_or(&stored_effort).to_string();
         let model_options: Vec<Value> = self
             .base_models()
@@ -610,7 +613,12 @@ impl Adapter {
             .unwrap_or("");
         let value = params.get("value").and_then(|v| v.as_str()).unwrap_or("");
 
-        if session_id.is_empty() || config_id.is_empty() || value.is_empty() {
+        // Note: an empty value is legal for the effort option (it selects the
+        // single "Default" choice of models without effort variants).
+        if session_id.is_empty()
+            || config_id.is_empty()
+            || (value.is_empty() && config_id != Self::EFFORT_CONFIG_ID)
+        {
             return JsonRpcResponse {
                 jsonrpc: "2.0",
                 id,
@@ -651,7 +659,14 @@ impl Adapter {
             .unwrap_or_default();
 
         let (new_base, new_effort) = if config_id == Self::EFFORT_CONFIG_ID {
-            let efforts = self.efforts_for(&current.0);
+            // T3 may send only effort (relying on the default model from
+            // session/new). Fall back to the first base instead of "".
+            let base_for_effort = if current.0.is_empty() {
+                self.base_models().first().cloned().unwrap_or_default()
+            } else {
+                current.0.clone()
+            };
+            let efforts = self.efforts_for(&base_for_effort);
             let effort = if efforts.contains(&value.to_string()) {
                 value.to_string()
             } else {
@@ -665,7 +680,7 @@ impl Adapter {
                     if efforts.contains(&e) { e } else { efforts.first().cloned().unwrap_or_default() }
                 }
             };
-            (current.0.clone(), effort)
+            (base_for_effort, effort)
         } else {
             let efforts = self.efforts_for(&base);
             let effort = if efforts.contains(&current.1) {

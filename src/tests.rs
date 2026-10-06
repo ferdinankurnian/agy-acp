@@ -1303,3 +1303,33 @@ fn test_effort_config_option_flow() {
     );
     assert_eq!(session.effort.as_deref(), Some(""));
 }
+
+#[test]
+fn test_effort_only_selection_defaults_to_first_base() {
+    // T3 sends only the effort option, relying on the session default model.
+    let mut adapter = effort_fixture();
+    let new_resp = adapter.handle_session_new(json!(1));
+    let session_id = new_resp.result.as_ref().unwrap()["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let resp = adapter.handle_session_set_config_option(
+        json!(2),
+        &json!({"sessionId": session_id, "configId": "effort", "value": "medium"}),
+    );
+    assert!(resp.error.is_none(), "error: {:?}", resp.error);
+    let session = adapter.sessions.get(&session_id).unwrap();
+    assert_eq!(session.model_id.as_deref(), Some("Gemini 3.8 Flash"));
+    assert_eq!(session.effort.as_deref(), Some("medium"));
+    let options = resp.result.as_ref().unwrap()["configOptions"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(options[1]["currentValue"].as_str(), Some("medium"));
+    // Spawn target reassembles the full variant.
+    assert_eq!(
+        adapter.variant_for("Gemini 3.8 Flash", "medium"),
+        "Gemini 3.8 Flash (Medium)"
+    );
+}
